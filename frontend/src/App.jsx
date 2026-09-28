@@ -441,6 +441,7 @@ function App() {
             <div>
               <div className="brand-name">DocuMind</div>
               <div className="brand-subtitle">Intelligent workspace</div>
+              <div className="brand-copyright">© 2026 Sushanth Prabhu</div>
             </div>
           </div>
 
@@ -556,10 +557,7 @@ function App() {
             </button>
           </div>
         </div>
-        <div className="sidebar-copyright">
-          © 2026 DocuMind · Built by Sushanth Prabhu
-        </div>
-
+        
       </aside>
 
       {/* Main */}

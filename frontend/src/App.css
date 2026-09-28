@@ -1955,3 +1955,9 @@ input:focus-visible {
   line-height: 1.75;
   color: #d9e0ea;
 }
+
+.brand-copyright {
+  margin-top: 3px;
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.35);
+}
