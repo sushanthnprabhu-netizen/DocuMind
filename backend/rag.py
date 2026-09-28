@@ -309,22 +309,45 @@ ANSWER:
 """
 
     try:
-        import ollama
+        groq_api_key = os.getenv("GROQ_API_KEY")
 
-        response = ollama.chat(
-            model="llama3.2:latest",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-        )
+        if groq_api_key:
+            from groq import Groq
 
-        answer = response["message"]["content"].strip()
+            client = Groq(api_key=groq_api_key)
 
-        if not answer:
-            raise RuntimeError("Ollama returned an empty response")
+            response = client.chat.completions.create(
+                model="openai/gpt-oss-20b",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
+
+            answer = response.choices[0].message.content.strip()
+
+            if not answer:
+                raise RuntimeError("Groq returned an empty response")
+
+        else:
+            import ollama
+
+            response = ollama.chat(
+                model="llama3.2:latest",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
+
+            answer = response["message"]["content"].strip()
+
+            if not answer:
+                raise RuntimeError("Ollama returned an empty response")
 
         return {
             "answer": answer,
@@ -336,7 +359,7 @@ ANSWER:
         return {
             "answer": (
                 "The relevant document sections were found, but I couldn't "
-                f"generate the AI response. Ollama error: {exc}"
+                f"generate the AI response. LLM error: {exc}"
             ),
             "sources": sources,
             "generated": False,
@@ -377,9 +400,7 @@ def _load_user_chunks(user_id: int) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def ingest_document(user_id: int, document_id: int, file_path: Path, filename: str) -> dict:
-    """Extract -> chunk -> store for one freshly-uploaded file. Returns
-    {'indexed': bool, 'chunk_count': int}. Safe to call for any file type;
-    unsupported/binary files simply come back as not indexed."""
+    """Extract -> chunk -> store for one freshly-uploaded file."""
     file_bytes = Path(file_path).read_bytes()
     text = extract_text(file_bytes, filename)
     chunks = chunk_text(text)
@@ -387,17 +408,37 @@ def ingest_document(user_id: int, document_id: int, file_path: Path, filename: s
     if not chunks:
         return {"indexed": False, "chunk_count": 0}
 
-    with _get_rag_db() as db:
-        db.executemany(
-            """
-            INSERT INTO document_chunks (user_id, document_id, filename, chunk_index, content)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            [
-                (user_id, document_id, filename, idx, content)
-                for idx, content in enumerate(chunks)
-            ],
+    rows = [
+        (
+            user_id,
+            document_id,
+            filename,
+            chunk_index,
+            chunk,
         )
+        for chunk_index, chunk in enumerate(chunks)
+    ]
+
+    with _get_rag_db() as db:
+        with db.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO document_chunks
+                (
+                    user_id,
+                    document_id,
+                    filename,
+                    chunk_index,
+                    content
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (document_id, chunk_index)
+                DO UPDATE SET
+                    content = EXCLUDED.content,
+                    filename = EXCLUDED.filename
+                """,
+                rows,
+            )
 
     invalidate_user_index(user_id)
     return {"indexed": True, "chunk_count": len(chunks)}

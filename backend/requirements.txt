@@ -11,3 +11,4 @@ numpy
 ollama==0.6.2
 psycopg[binary]
 python-dotenv
+groq
