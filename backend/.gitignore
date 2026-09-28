@@ -1,0 +1,6 @@
+app.db
+rag_store.db
+uploads/
+__pycache__/
+.venv/
+*.pyc

@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+scikit-learn
+faiss-cpu
+langchain-text-splitters
+pypdf
+python-docx
+openpyxl
+numpy
+ollama==0.6.2
