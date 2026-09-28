@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import csv
 import io
-import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+import os
+from dotenv import load_dotenv
+import psycopg
+from psycopg.rows import dict_row
 
 import numpy as np
 import faiss
@@ -34,7 +38,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 BASE_DIR = Path(__file__).resolve().parent
-RAG_DB_PATH = BASE_DIR / "rag_store.db"
+
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured in backend/.env")
 
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
@@ -334,29 +342,18 @@ ANSWER:
             "generated": False,
         }
 # --------------------------------------------------------------------------
-# Self-contained persistence for chunks (separate small SQLite DB, so this
-# module doesn't need to share a connection/schema with main.py).
+# Supabase persistence for document chunks
 # --------------------------------------------------------------------------
 
 @contextmanager
 def _get_rag_db():
-    conn = sqlite3.connect(RAG_DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                document_id INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                chunk_index INTEGER NOT NULL,
-                content TEXT NOT NULL
-            )
-            """
-        )
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -364,10 +361,15 @@ def _get_rag_db():
 def _load_user_chunks(user_id: int) -> list[dict]:
     with _get_rag_db() as db:
         rows = db.execute(
-            "SELECT id, document_id, filename, chunk_index, content FROM chunks WHERE user_id = ?",
+            """
+            SELECT id, document_id, filename, chunk_index, content
+            FROM document_chunks
+            WHERE user_id = %s
+            ORDER BY id
+            """,
             (user_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return rows
 
 
 # --------------------------------------------------------------------------
@@ -386,27 +388,31 @@ def ingest_document(user_id: int, document_id: int, file_path: Path, filename: s
         return {"indexed": False, "chunk_count": 0}
 
     with _get_rag_db() as db:
-        for idx, content in enumerate(chunks):
-            db.execute(
-                """
-                INSERT INTO chunks (user_id, document_id, filename, chunk_index, content)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (user_id, document_id, filename, idx, content),
-            )
+        db.executemany(
+            """
+            INSERT INTO document_chunks (user_id, document_id, filename, chunk_index, content)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            [
+                (user_id, document_id, filename, idx, content)
+                for idx, content in enumerate(chunks)
+            ],
+        )
 
     invalidate_user_index(user_id)
     return {"indexed": True, "chunk_count": len(chunks)}
 
 
-def delete_document_chunks(document_id: int) -> None:
+def delete_document_chunks(document_id: int, user_id: int | None = None) -> None:
+    """Delete chunk rows when needed and invalidate the user's FAISS cache."""
     with _get_rag_db() as db:
-        row = db.execute(
-            "SELECT user_id FROM chunks WHERE document_id = ? LIMIT 1",
-            (document_id,),
-        ).fetchone()
-        user_id = row["user_id"] if row else None
-        db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+        if user_id is None:
+            row = db.execute(
+                "SELECT user_id FROM document_chunks WHERE document_id = %s LIMIT 1",
+                (document_id,),
+            ).fetchone()
+            user_id = row["user_id"] if row else None
+        db.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
 
     if user_id is not None:
         invalidate_user_index(user_id)

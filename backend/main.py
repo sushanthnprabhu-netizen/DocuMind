@@ -2,7 +2,6 @@ import hashlib
 import hmac
 import os
 import secrets
-import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +10,9 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from dotenv import load_dotenv
+import psycopg
+from psycopg.rows import dict_row
 
 import rag
 
@@ -36,64 +38,26 @@ app.add_middleware(
 
 
 # --------------------------------------------------------------------------
-# Database
+# Database — Supabase PostgreSQL
 # --------------------------------------------------------------------------
+
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured in backend/.env")
+
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     try:
         yield conn
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-
-
-def init_db():
-    with get_db() as db:
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                password_hash TEXT NOT NULL,
-                salt TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                token TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-            )
-            """
-        )
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                original_name TEXT NOT NULL,
-                stored_name TEXT NOT NULL,
-                content_type TEXT,
-                size_bytes INTEGER NOT NULL,
-                uploaded_at TEXT NOT NULL,
-                indexed INTEGER NOT NULL DEFAULT 0,
-                chunk_count INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-            )
-            """
-        )
-
-
-init_db()
 
 
 # --------------------------------------------------------------------------
@@ -115,20 +79,20 @@ def verify_password(password: str, password_hash: str, salt: str) -> bool:
 # Auth helpers
 # --------------------------------------------------------------------------
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def create_session(db, user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     db.execute(
-        "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
-        (token, user_id, now_iso()),
+        "INSERT INTO sessions (token, user_id, created_at) VALUES (%s, %s, %s)",
+        (token, user_id, now_utc()),
     )
     return token
 
 
-def get_current_user(authorization: str | None) -> sqlite3.Row:
+def get_current_user(authorization: str | None) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     token = authorization.removeprefix("Bearer ").strip()
@@ -138,7 +102,7 @@ def get_current_user(authorization: str | None) -> sqlite3.Row:
             """
             SELECT users.* FROM sessions
             JOIN users ON users.id = sessions.user_id
-            WHERE sessions.token = ?
+            WHERE sessions.token = %s
             """,
             (token,),
         ).fetchone()
@@ -148,7 +112,7 @@ def get_current_user(authorization: str | None) -> sqlite3.Row:
     return row
 
 
-def user_public(row: sqlite3.Row) -> dict:
+def user_public(row: dict) -> dict:
     return {"id": row["id"], "email": row["email"], "name": row["name"]}
 
 
@@ -202,17 +166,21 @@ def register(payload: RegisterPayload):
     password_hash, salt = hash_password(payload.password)
 
     with get_db() as db:
-        existing = db.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        existing = db.execute("SELECT id FROM users WHERE email = %s", (email,)).fetchone()
         if existing:
             raise HTTPException(status_code=409, detail="An account with this email already exists")
 
-        cursor = db.execute(
-            "INSERT INTO users (email, name, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)",
-            (email, payload.name.strip(), password_hash, salt, now_iso()),
-        )
-        user_id = cursor.lastrowid
+        row = db.execute(
+            """
+            INSERT INTO users (email, name, password_hash, salt, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (email, payload.name.strip(), password_hash, salt, now_utc()),
+        ).fetchone()
+        user_id = row["id"]
         token = create_session(db, user_id)
-        user_row = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        user_row = db.execute("SELECT * FROM users WHERE id = %s", (user_id,)).fetchone()
 
     return {"token": token, "user": user_public(user_row)}
 
@@ -222,7 +190,7 @@ def login(payload: LoginPayload):
     email = payload.email.strip().lower()
 
     with get_db() as db:
-        user_row = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        user_row = db.execute("SELECT * FROM users WHERE email = %s", (email,)).fetchone()
         if not user_row or not verify_password(payload.password, user_row["password_hash"], user_row["salt"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
@@ -236,7 +204,7 @@ def logout(authorization: str | None = Header(default=None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization.removeprefix("Bearer ").strip()
         with get_db() as db:
-            db.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            db.execute("DELETE FROM sessions WHERE token = %s", (token,))
     return {"ok": True}
 
 
@@ -250,7 +218,7 @@ def me(authorization: str | None = Header(default=None)):
 # Document routes
 # --------------------------------------------------------------------------
 
-def doc_public(row: sqlite3.Row) -> dict:
+def doc_public(row: dict) -> dict:
     size = row["size_bytes"]
     size_label = f"{size / (1024 * 1024):.1f} MB" if size >= 1024 * 1024 else f"{max(1, round(size / 1024))} KB"
     return {
@@ -270,7 +238,7 @@ def list_documents(authorization: str | None = Header(default=None)):
     user_row = get_current_user(authorization)
     with get_db() as db:
         rows = db.execute(
-            "SELECT * FROM documents WHERE user_id = ? ORDER BY uploaded_at DESC",
+            "SELECT * FROM documents WHERE user_id = %s ORDER BY uploaded_at DESC",
             (user_row["id"],),
         ).fetchall()
     return {"documents": [doc_public(r) for r in rows]}
@@ -295,14 +263,15 @@ async def upload_document(
     dest_path.write_bytes(contents)
 
     with get_db() as db:
-        cursor = db.execute(
+        row = db.execute(
             """
             INSERT INTO documents (user_id, original_name, stored_name, content_type, size_bytes, uploaded_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
-            (user_row["id"], file.filename, stored_name, file.content_type, len(contents), now_iso()),
-        )
-        document_id = cursor.lastrowid
+            (user_row["id"], file.filename, stored_name, file.content_type, len(contents), now_utc()),
+        ).fetchone()
+        document_id = row["id"]
 
     # Run the RAG ingestion pipeline: extract -> chunk -> embed -> store in
     # the vector DB. Best-effort: unsupported formats (images, .xlsx, etc.)
@@ -315,10 +284,10 @@ async def upload_document(
 
     with get_db() as db:
         db.execute(
-            "UPDATE documents SET indexed = ?, chunk_count = ? WHERE id = ?",
+            "UPDATE documents SET indexed = %s, chunk_count = %s WHERE id = %s",
             (1 if index_result["indexed"] else 0, index_result["chunk_count"], document_id),
         )
-        doc_row = db.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+        doc_row = db.execute("SELECT * FROM documents WHERE id = %s", (document_id,)).fetchone()
 
     return doc_public(doc_row)
 
@@ -329,7 +298,7 @@ def download_document(document_id: int, authorization: str | None = Header(defau
 
     with get_db() as db:
         doc_row = db.execute(
-            "SELECT * FROM documents WHERE id = ? AND user_id = ?",
+            "SELECT * FROM documents WHERE id = %s AND user_id = %s",
             (document_id, user_row["id"]),
         ).fetchone()
 
@@ -353,7 +322,7 @@ def delete_document(document_id: int, authorization: str | None = Header(default
 
     with get_db() as db:
         doc_row = db.execute(
-            "SELECT * FROM documents WHERE id = ? AND user_id = ?",
+            "SELECT * FROM documents WHERE id = %s AND user_id = %s",
             (document_id, user_row["id"]),
         ).fetchone()
 
@@ -364,9 +333,10 @@ def delete_document(document_id: int, authorization: str | None = Header(default
         if file_path.exists():
             file_path.unlink()
 
-        db.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+        db.execute("DELETE FROM documents WHERE id = %s", (document_id,))
 
-    rag.delete_document_chunks(document_id)
+    # document_chunks rows are removed by the ON DELETE CASCADE foreign key.
+    rag.invalidate_user_index(user_row["id"])
 
     return {"ok": True}
 
@@ -387,7 +357,7 @@ def ask_assistant(payload: AskPayload, authorization: str | None = Header(defaul
 
     with get_db() as db:
         rows = db.execute(
-            "SELECT * FROM documents WHERE user_id = ? ORDER BY uploaded_at DESC",
+            "SELECT * FROM documents WHERE user_id = %s ORDER BY uploaded_at DESC",
             (user_row["id"],),
         ).fetchall()
 
