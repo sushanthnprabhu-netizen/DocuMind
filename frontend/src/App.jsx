@@ -538,6 +538,7 @@ function App() {
           <span className="storage-text">
             2.4 GB of 10 GB used
           </span>
+        
 
           <div className="user-card">
             <div className="avatar">{user?.name?.[0]?.toUpperCase() || "U"}</div>
@@ -555,6 +556,10 @@ function App() {
             </button>
           </div>
         </div>
+        <div className="sidebar-copyright">
+          © 2026 DocuMind · Built by Sushanth Prabhu
+        </div>
+
       </aside>
 
       {/* Main */}
