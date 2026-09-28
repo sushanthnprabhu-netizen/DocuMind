@@ -12,6 +12,11 @@ DocuMind is a full-stack web application where users create an account, upload d
 ![LLM](https://img.shields.io/badge/LLM-Ollama%20%7C%20Llama%203.2-black)
 
 ---
+## Live Demo
+
+🌐 **Working Website:** https://docu-mind-eight-coral.vercel.app/
+
+The frontend is deployed on Vercel, with the FastAPI backend deployed on Render and PostgreSQL data stored in Supabase.
 
 ## Table of Contents
 
